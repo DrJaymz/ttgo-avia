@@ -1,0 +1,14 @@
+{
+    "files.associations": {
+        "*.json": "jsonc",
+        "array": "cpp",
+        "deque": "cpp",
+        "map": "cpp",
+        "*.tcc": "cpp",
+        "string": "cpp",
+        "unordered_map": "cpp",
+        "unordered_set": "cpp",
+        "vector": "cpp",
+        "cmath": "cpp"
+    }
+}
