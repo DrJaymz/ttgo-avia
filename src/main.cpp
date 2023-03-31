@@ -7,6 +7,7 @@
 #include <WiFiUdp.h>
 #include <DNSServer.h>
 #include <HTTPClient.h>
+#include <esp32-hal.h>
 #include "WiFiManager.h" //https://github.com/tzapu/WiFiManager
 
 #include "Filter.h"
@@ -15,6 +16,7 @@
 #include "lcd.h"
 #include "Button2.h"
 #include "espNow.h"
+#include "max6675.h"
 
 #include <esp32-hal-timer.h>
 #include <driver/dac.h>
@@ -27,13 +29,25 @@ TelnetSpy debug;
 #define DAC_CH1 25
 #define ADC_RES 12
 #define ADC_FILTER 1 // new value weight out of 100
+#define BUS_FILTER 0.1
 
 ExponentialFilter<float> filterBat(ADC_FILTER, 0.0);
+ExponentialFilter<float> filterAmp(ADC_FILTER, 0.0);
+
 ExponentialFilter<float> filterCh1(ADC_FILTER, 0.0);
 ExponentialFilter<float> filterCh2(ADC_FILTER, 0.0);
 ExponentialFilter<float> filterCh3(ADC_FILTER, 0.0);
 ExponentialFilter<float> filterCh4(ADC_FILTER, 0.0);
+
+ExponentialFilter<float> filterCht1(10, 0.0);
+
+int ampOffset = 0;
+bool ampReadingValid = false;
+
 ESPNowTransmitter espNow(remotePeerMacAddress);
+MAX6675 t(THERM_SCK, THERM_CS, THERM_SO);
+
+// MAX6675 thermocouple(THERM_SCK, THERM_CS, THERM_SO);
 
 //! Long time delay, it is recommended to use shallow sleep, which can effectively reduce the current consumption
 void espDelay(int ms)
@@ -156,8 +170,8 @@ void timerCallback(void *arg)
 {
   static long timerCalls;
 
-  // Every x cycled this happens
-  if (timerCalls % 50 == 0)
+  // Every x cycles this happens
+  if (timerCalls % 10 == 0)
   {
     timerElapsed++;
     screenUpdate = true;
@@ -181,7 +195,12 @@ void setupTimer()
   esp_timer_start_periodic(timerHandle, 10000);
 }
 
-int SineValues[256]; // an array to store our values for sine
+// get die temperature
+float readEspTemp()
+{
+  float celsius = ((temprature_sens_read() - 32) / 1.8) - 32;
+  return celsius;
+}
 
 void setup()
 {
@@ -209,6 +228,7 @@ void setup()
   analogSetAttenuation(ADC_11db); // Set the input attenuation to 11 dB (for input voltages up to 3.6V)
   espNow.init();
 
+  // debug.printf("i: thermocouple: %f\n",thermocouple.readCelsius());
 }
 
 void array_to_string(byte array[], unsigned int len, char buffer[])
@@ -264,9 +284,12 @@ void drawHorizontalGauge(int x, int y, int width, int height, float currentValue
 void updateScreen(int frame)
 {
   SensorData data;
-  
-  static bool fuelQtyError, fuelPressError, oilPressError, oilTempError;
-  static float batteryVoltage, fuelPress, fuelLitres, oilTemp, oilPress;
+
+  static bool fuelQtyError, fuelPressError, oilPressError, oilTempError, ampError, cht1Error;
+  static float batteryVoltage, fuelPress, fuelLitres, oilTemp, oilPress, amp, cht1;
+
+  // amp is linear
+  amp = ((0.0306 * (filterAmp.Current() - ampOffset) - 0.0454));
 
   batteryVoltage = -3E-07 * pow(filterBat.Current(), 2) + 0.00592 * filterBat.Current() - 1.0495;
   //= -2E-05x2 - 0.0178x + 108.95
@@ -289,7 +312,14 @@ void updateScreen(int frame)
   float scaledOPress = filterCh4.Current() * ((14.0 / batteryVoltage)) - ((batteryVoltage - 14.0) * 15);
   oilPress = (-7.77482E-10 * pow(scaledOPress, 3)) + (9.95165E-07 * pow(scaledOPress, 2)) - (0.002652107 * scaledOPress) + 5.992594213;
 
-  fuelQtyError = fuelPressError = oilPressError = oilTempError = false;
+  cht1 = filterCht1.Current();
+  if (cht1 < 0 || cht1 > 400)
+  {
+    cht1 = -1;
+    cht1Error = true;
+  }
+
+  fuelQtyError = fuelPressError = oilPressError = oilTempError = cht1Error = false;
 
   if (fuelLitres < 0)
   {
@@ -335,9 +365,11 @@ void updateScreen(int frame)
     oilPressError = true;
   }
 
+  ampError = !ampReadingValid;
+
   //-3E-07x2 + 0.006x - 1.0495
 
-  int xLocation = 0, yLocation = 0, yIncrement = 20;
+  int xLocation = 0, yLocation = 0, yIncrement = 18;
   tft.setTextSize(2);
 
   sprintf(string, "Bus V:%0.1f (%i)  ", batteryVoltage + 0.05, frame);
@@ -368,9 +400,19 @@ void updateScreen(int frame)
   yLocation += yIncrement;
   tft.setCursor(xLocation, yLocation);
   tft.print(string);
-  // TFT_printLine(string, false);
 
-  // drawHorizontalGauge(10, 40, 200, 40, fuelLitres, 120);
+  sprintf(string, "cht1:%0i  %0.0f ", (int)cht1, readEspTemp());
+  yLocation += yIncrement;
+  tft.setCursor(xLocation, yLocation);
+  tft.print(string);
+
+  if (ampReadingValid)
+  {
+    sprintf(string, "Amp:%0.1f   ", amp);
+    yLocation += yIncrement;
+    tft.setCursor(xLocation, yLocation);
+    tft.print(string);
+  }
 
   data.fuelQtyError = fuelQtyError;
   data.fuelPressError = fuelPressError;
@@ -382,9 +424,10 @@ void updateScreen(int frame)
   data.oilTemp = oilTemp;
   data.oilPress = oilPress;
   data.frame = frame;
+  data.amp = (int)amp + 0.5;
+  data.ampError = ampError;
 
   espNow.sendData(&data, sizeof(data));
-
 }
 
 void loop()
@@ -395,16 +438,55 @@ void loop()
   btn2.loop();
   static int lastFilteredValue;
   static int count;
+  static bool firstRun = false;
+  static long nextTempReading = millis() + 1000;
+
+  if (!ampReadingValid && millis() > 10000)
+  {
+    ampOffset = filterAmp.Current();
+    ampReadingValid = true;
+  }
 
   // this will run much faster than the actual screen update
   if (adcTimer)
   {
 
-    filterBat.Filter(analogRead(ADC_BAT));
-    filterCh1.Filter(analogRead(ADC_CH1));
-    filterCh2.Filter(analogRead(ADC_CH2));
-    filterCh3.Filter(analogRead(ADC_CH3));
-    filterCh4.Filter(analogRead(ADC_CH4));
+    if (firstRun)
+    {
+      filterBat.SetCurrent(analogRead(ADC_BAT));
+      filterCh1.SetCurrent(analogRead(ADC_CH1));
+      filterCh2.SetCurrent(analogRead(ADC_CH2));
+      filterCh3.SetCurrent(analogRead(ADC_CH3));
+      filterCh4.SetCurrent(analogRead(ADC_CH4));
+      filterAmp.SetCurrent(analogRead(ADC_AMP));
+      filterCht1.SetCurrent(t.readCelsius() + CHT1_COMPENSATION);
+      firstRun = false;
+    }
+    else
+    {
+      filterBat.Filter(analogRead(ADC_BAT));
+      filterCh1.Filter(analogRead(ADC_CH1));
+      filterCh2.Filter(analogRead(ADC_CH2));
+      filterCh3.Filter(analogRead(ADC_CH3));
+      filterCh4.Filter(analogRead(ADC_CH4));
+      filterAmp.Filter(analogRead(ADC_AMP));
+
+      // don't read the temp reading too often
+      if (millis() > nextTempReading)
+      {
+        float cht1 = t.readCelsius() + CHT1_COMPENSATION;
+        if (!isnanf(cht1))
+        {
+          filterCht1.Filter(cht1);
+        }
+        else
+        {
+          filterCht1.SetCurrent(-1);
+        }
+
+        nextTempReading = millis() + 250;
+      }
+    }
 
     adcTimer = false;
   }
