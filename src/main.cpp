@@ -21,30 +21,50 @@
 #include <esp32-hal-timer.h>
 #include <driver/dac.h>
 #include <math.h>
+#include <RunningMedian.h>
 
 // other crap
 char string[16];
 TelnetSpy debug;
 
+uint8_t kRemotePeerMacAddress[6] = {0x24, 0xD7, 0xEB, 0x38, 0xF8, 0x24};
+
 #define DAC_CH1 25
 #define ADC_RES 12
-#define ADC_FILTER 1 // new value weight out of 100
-#define BUS_FILTER 0.1
+// #define ADC_FILTER 1 // new value weight out of 100
+// #define BUS_FILTER 0.1
+#define UPDATE_RATE_USEC 10000
+#define UPDATE_RATE = (1000000 / UPDATE_RATE_USEC) // samples per second
+#define SIMULATE 1
 
-ExponentialFilter<float> filterBat(ADC_FILTER, 0.0);
-ExponentialFilter<float> filterAmp(ADC_FILTER, 0.0);
+// Keep ranges aligned with ../Avia Display/src/global.h
+constexpr float kFuelQtyMin = 0.0f;
+constexpr float kFuelQtyMax = 120.0f;
+constexpr float kFuelPressMin = 0.0f;
+constexpr float kFuelPressMax = 350.0f;
+constexpr float kOilTempMin = 0.0f;
+constexpr float kOilTempMax = 140.0f;
+constexpr float kOilPressMin = 0.0f;
+constexpr float kOilPressMax = 7.0f;
+constexpr float kChtMin = 0.0f;
+constexpr float kChtMax = 250.0f;
 
-ExponentialFilter<float> filterCh1(ADC_FILTER, 0.0);
-ExponentialFilter<float> filterCh2(ADC_FILTER, 0.0);
-ExponentialFilter<float> filterCh3(ADC_FILTER, 0.0);
-ExponentialFilter<float> filterCh4(ADC_FILTER, 0.0);
+// filtering
+#define MEDIAN_FILTER_SAMPLES 99
+#define MEDIAN_FILTER_AVG_SAMPLES 5 // the number of sample that we are going to get our value from.
 
-ExponentialFilter<float> filterCht1(10, 0.0);
+RunningMedian filterBat = RunningMedian(MEDIAN_FILTER_SAMPLES);
+RunningMedian filterAmp = RunningMedian(MEDIAN_FILTER_SAMPLES);
+RunningMedian filterCh1 = RunningMedian(MEDIAN_FILTER_SAMPLES);
+RunningMedian filterCh2 = RunningMedian(MEDIAN_FILTER_SAMPLES);
+RunningMedian filterCh3 = RunningMedian(MEDIAN_FILTER_SAMPLES);
+RunningMedian filterCh4 = RunningMedian(MEDIAN_FILTER_SAMPLES);
+RunningMedian filterCht1 = RunningMedian(15);
 
 int ampOffset = 0;
 bool ampReadingValid = false;
 
-ESPNowTransmitter espNow(remotePeerMacAddress);
+ESPNowTransmitter espNow(kRemotePeerMacAddress);
 MAX6675 t(THERM_SCK, THERM_CS, THERM_SO);
 
 // MAX6675 thermocouple(THERM_SCK, THERM_CS, THERM_SO);
@@ -170,7 +190,7 @@ void timerCallback(void *arg)
 {
   static long timerCalls;
 
-  // Every x cycles this happens
+  // readings are read 100 / sec, but the screen updates on 10 / sec.  The screen update also is the transmission data frame rate
   if (timerCalls % 10 == 0)
   {
     timerElapsed++;
@@ -192,7 +212,7 @@ void setupTimer()
   esp_timer_create(&timerArgs, &timerHandle);
 
   // Start the timer with a period of 100 th second (in microseconds)
-  esp_timer_start_periodic(timerHandle, 10000);
+  esp_timer_start_periodic(timerHandle, UPDATE_RATE_USEC);
 }
 
 // get die temperature
@@ -289,79 +309,104 @@ void updateScreen(int frame)
   static float batteryVoltage, fuelPress, fuelLitres, oilTemp, oilPress, amp, cht1;
 
   // amp is linear
-  amp = ((0.0306 * (filterAmp.Current() - ampOffset) - 0.0454));
+  amp = ((0.0306 * (filterAmp.getMedianAverage(MEDIAN_FILTER_AVG_SAMPLES) - ampOffset) - 0.0454));
 
-  batteryVoltage = -3E-07 * pow(filterBat.Current(), 2) + 0.00592 * filterBat.Current() - 1.0495;
+  batteryVoltage = -3E-07 * pow(filterBat.getMedianAverage(MEDIAN_FILTER_AVG_SAMPLES), 2) + 0.00592 * filterBat.getMedianAverage(MEDIAN_FILTER_AVG_SAMPLES) - 1.0495;
   //= -2E-05x2 - 0.0178x + 108.95
   // scale the ADC so if voltage lower than 14 the readings will scale
   // 14 is the nominal calibrated system voltage
-  float scaledFuel = filterCh1.Current() * ((14.0 / batteryVoltage)) - ((batteryVoltage - 14.0) * 15);
+  float scaledFuel = filterCh1.getMedianAverage(MEDIAN_FILTER_AVG_SAMPLES) * ((14.0 / batteryVoltage)) - ((batteryVoltage - 14.0) * 15);
   // work out the fuel
   fuelLitres = -2E-05 * pow(scaledFuel, 2) - 0.0178 * scaledFuel + 105.95;
 
   //-1E-05x2 - 0.0233x + 169.87
-  float scaledTemp = filterCh3.Current() * ((14.0 / batteryVoltage)) - ((batteryVoltage - 14.0) * 15);
+  float scaledTemp = filterCh3.getMedianAverage(MEDIAN_FILTER_AVG_SAMPLES) * ((14.0 / batteryVoltage)) - ((batteryVoltage - 14.0) * 15);
   oilTemp = (-0.000011 * pow(scaledTemp, 2)) - (0.0233 * scaledTemp) + 167.87;
 
   // fuel press: = -7.50346E-05x2 - 0.066831183x + 348.8144776
   // min 34psi
-  float scaledFPress = filterCh2.Current() * ((14.0 / batteryVoltage)) - ((batteryVoltage - 14.0) * 15);
+  float scaledFPress = filterCh2.getMedianAverage(MEDIAN_FILTER_AVG_SAMPLES) * ((14.0 / batteryVoltage)) - ((batteryVoltage - 14.0) * 15);
   fuelPress = (-7.50346E-05 * pow(scaledFPress, 2)) - (0.066831183 * scaledFPress) + 348.8144776;
 
   // oil press: =  -7.77482E-10x3 + 9.95165E-07x2 - 0.002652107x + 5.992594213
-  float scaledOPress = filterCh4.Current() * ((14.0 / batteryVoltage)) - ((batteryVoltage - 14.0) * 15);
+  float scaledOPress = filterCh4.getMedianAverage(MEDIAN_FILTER_AVG_SAMPLES) * ((14.0 / batteryVoltage)) - ((batteryVoltage - 14.0) * 15);
   oilPress = (-7.77482E-10 * pow(scaledOPress, 3)) + (9.95165E-07 * pow(scaledOPress, 2)) - (0.002652107 * scaledOPress) + 5.992594213;
 
-  cht1 = filterCht1.Current();
-  if (cht1 < 0 || cht1 > 400)
+  cht1 = filterCht1.getMedianAverage(MEDIAN_FILTER_AVG_SAMPLES);
+  if (cht1 < kChtMin || cht1 > kChtMax)
   {
-    cht1 = -1;
+    if (cht1 < kChtMin)
+      cht1 = kChtMin;
+    else
+      cht1 = kChtMax;
     cht1Error = true;
   }
 
   fuelQtyError = fuelPressError = oilPressError = oilTempError = cht1Error = false;
 
+  if (SIMULATE)
+  {
+    const float t = millis() / 1000.0f;
+    auto wave = [](float x, float minV, float maxV, float spanScale) {
+      float s = 0.5f + 0.5f * sinf(x);
+      float mid = (minV + maxV) * 0.5f;
+      float span = (maxV - minV) * 0.5f * spanScale;
+      return mid + (s * 2.0f - 1.0f) * span;
+    };
+
+    const float spanScale = 0.1f; // 10% of full range for smaller steps
+    batteryVoltage = wave(t * 0.5f, 11.0f, 14.5f, spanScale);
+    fuelLitres = wave(t * 0.2f + 1.0f, kFuelQtyMin, kFuelQtyMax, spanScale);
+    fuelPress = wave(t * 0.35f + 2.0f, kFuelPressMin, kFuelPressMax, spanScale);
+    oilTemp = wave(t * 0.25f + 3.0f, kOilTempMin, kOilTempMax, spanScale);
+    oilPress = wave(t * 0.4f + 4.0f, kOilPressMin, kOilPressMax, spanScale);
+    cht1 = wave(t * 0.3f + 5.0f, kChtMin, kChtMax, spanScale);
+    amp = wave(t * 0.6f + 6.0f, -20.0f, 20.0f, spanScale);
+
+    ampReadingValid = true;
+  }
+
   if (fuelLitres < 0)
   {
-    fuelLitres = 0;
+    fuelLitres = kFuelQtyMin;
     fuelQtyError = true;
   }
-  if (fuelLitres > 120)
+  if (fuelLitres > kFuelQtyMax)
   {
-    fuelLitres = 120;
+    fuelLitres = kFuelQtyMax;
     fuelQtyError = true;
   }
 
   if (oilTemp < 0)
   {
-    oilTemp = 0;
+    oilTemp = kOilTempMin;
     oilTempError = true;
   }
-  if (oilTemp > 150)
+  if (oilTemp > kOilTempMax)
   {
-    oilTemp = 150;
+    oilTemp = kOilTempMax;
     oilTempError = true;
   }
 
   if (fuelPress < 0)
   {
-    fuelPress = 0;
+    fuelPress = kFuelPressMin;
     fuelPressError = true;
   }
-  if (fuelPress > 360)
+  if (fuelPress > kFuelPressMax)
   {
-    fuelPress = 350;
+    fuelPress = kFuelPressMax;
     fuelPressError = true;
   }
 
   if (oilPress < 0)
   {
-    oilPress = 0;
+    oilPress = kOilPressMin;
     oilPressError = true;
   }
-  if (oilPress > 7)
+  if (oilPress > kOilPressMax)
   {
-    oilPress = 7;
+    oilPress = kOilPressMax;
     oilPressError = true;
   }
 
@@ -375,6 +420,25 @@ void updateScreen(int frame)
   sprintf(string, "Bus V:%0.1f (%i)  ", batteryVoltage + 0.05, frame);
   tft.setCursor(xLocation, yLocation);
   tft.print(string);
+
+  // Flashing red S indicator when simulating.
+  if (SIMULATE)
+  {
+    const bool blinkOn = ((millis() / 500) % 2) == 0;
+    const int sW = 12;
+    const int sH = 16;
+    const int sx = tft.width() - sW;
+    const int sy = 0;
+    tft.fillRect(sx, sy, sW, sH, TFT_BLACK);
+    if (blinkOn)
+    {
+      tft.setTextColor(TFT_RED, TFT_BLACK);
+      tft.setTextSize(2);
+      tft.setCursor(sx, sy);
+      tft.print("S");
+    }
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  }
   // TFT_printLine(string, true);
 
   sprintf(string, "F Qty:%i %i   ", (int)fuelLitres, fuelQtyError);
@@ -426,8 +490,16 @@ void updateScreen(int frame)
   data.frame = frame;
   data.amp = (int)amp + 0.5;
   data.ampError = ampError;
+  data.cht1 = cht1;
 
   espNow.sendData(&data, sizeof(data));
+}
+
+float getRandomFloat()
+{
+  long randNumber = random(0, 601);            // Generates a number from 0 to 600
+  float scaled = (randNumber / 1000.0f) * 0.6; // Scale it down to 0.0 - 0.6
+  return scaled + 0.7;                         // Shift the scale to 0.7 - 1.3
 }
 
 void loop()
@@ -440,10 +512,21 @@ void loop()
   static int count;
   static bool firstRun = false;
   static long nextTempReading = millis() + 1000;
+  static long nextSimulatedReading = millis() + 10000;
+  static float simMultiplier = 1.0;
+
+  if (SIMULATE)
+  {
+    if (millis() > nextSimulatedReading)
+    {
+      simMultiplier = getRandomFloat();
+      nextSimulatedReading = millis() + 10000;
+    }
+  }
 
   if (!ampReadingValid && millis() > 10000)
   {
-    ampOffset = filterAmp.Current();
+    ampOffset = filterAmp.getMedianAverage(MEDIAN_FILTER_AVG_SAMPLES);
     ampReadingValid = true;
   }
 
@@ -451,40 +534,55 @@ void loop()
   if (adcTimer)
   {
 
-    if (firstRun)
+    if (SIMULATE)
     {
-      filterBat.SetCurrent(analogRead(ADC_BAT));
-      filterCh1.SetCurrent(analogRead(ADC_CH1));
-      filterCh2.SetCurrent(analogRead(ADC_CH2));
-      filterCh3.SetCurrent(analogRead(ADC_CH3));
-      filterCh4.SetCurrent(analogRead(ADC_CH4));
-      filterAmp.SetCurrent(analogRead(ADC_AMP));
-      filterCht1.SetCurrent(t.readCelsius() + CHT1_COMPENSATION);
+
+      filterBat.add(2744);
+      filterCh1.add(1388 * simMultiplier); // fuel
+      filterCh2.add(755 * simMultiplier);  // f press
+      filterCh3.add(1904 * simMultiplier); // oil T
+      filterCh4.add(407 * simMultiplier);  // oil press
+      filterAmp.add(1500 * simMultiplier);
+      filterCht1.add(150 * simMultiplier);
       firstRun = false;
     }
     else
     {
-      filterBat.Filter(analogRead(ADC_BAT));
-      filterCh1.Filter(analogRead(ADC_CH1));
-      filterCh2.Filter(analogRead(ADC_CH2));
-      filterCh3.Filter(analogRead(ADC_CH3));
-      filterCh4.Filter(analogRead(ADC_CH4));
-      filterAmp.Filter(analogRead(ADC_AMP));
-
-      // don't read the temp reading too often
-      if (millis() > nextTempReading)
+      if (firstRun)
       {
-        float cht1 = t.readCelsius() + CHT1_COMPENSATION;
-        if (!isnanf(cht1))
-        {
-          filterCht1.Filter(cht1);
-        }
-        else
-        {
-          filterCht1.SetCurrent(-1);
-        }
+        filterBat.add(analogRead(ADC_BAT));
+        filterCh1.add(analogRead(ADC_CH1));
+        filterCh2.add(analogRead(ADC_CH2));
+        filterCh3.add(analogRead(ADC_CH3));
+        filterCh4.add(analogRead(ADC_CH4));
+        filterAmp.add(analogRead(ADC_AMP));
+        filterCht1.add(t.readCelsius() + CHT1_COMPENSATION);
+        firstRun = false;
+      }
+      else
+      {
+        filterBat.add(analogRead(ADC_BAT));
+        filterCh1.add(analogRead(ADC_CH1));
+        filterCh2.add(analogRead(ADC_CH2));
+        filterCh3.add(analogRead(ADC_CH3));
+        filterCh4.add(analogRead(ADC_CH4));
+        filterAmp.add(analogRead(ADC_AMP));
 
-        nextTempReading = millis() + 250;
+        // don't read the temp reading too often
+        if (millis() > nextTempReading)
+        {
+          float cht1 = t.readCelsius() + CHT1_COMPENSATION;
+          if (!isnanf(cht1))
+          {
+            filterCht1.add(cht1);
+          }
+          else
+          {
+            filterCht1.clear();
+          }
+
+          nextTempReading = millis() + 250;
+        }
       }
     }
 

@@ -32,6 +32,9 @@
 #define DEBUG 1
 #define CHT1_COMPENSATION -15
 
+// ESP-NOW peer MAC (receiver). Update this to match the display unit.
+extern uint8_t kRemotePeerMacAddress[6];
+
 extern TelnetSpy debug;
 extern TFT_eSPI tft;
 

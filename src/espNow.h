@@ -4,9 +4,7 @@
 #include <Arduino.h>
 #include <esp_now.h>
 
-// MAC:24:D7:EB:38:F8:24
-
-uint8_t remotePeerMacAddress[] = {0x24, 0xD7, 0xEB, 0x38, 0xF8, 0x24};
+#include "global.h"
 
 class ESPNowTransmitter
 {
