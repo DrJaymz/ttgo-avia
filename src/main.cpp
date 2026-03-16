@@ -20,11 +20,12 @@
 
 #include <esp32-hal-timer.h>
 #include <driver/dac.h>
+#include <esp_timer.h>
 #include <math.h>
 #include <RunningMedian.h>
 
 // other crap
-char string[16];
+char string[32];
 TelnetSpy debug;
 
 uint8_t kRemotePeerMacAddress[6] = {0x24, 0xD7, 0xEB, 0x38, 0xF8, 0x24};
@@ -35,7 +36,7 @@ uint8_t kRemotePeerMacAddress[6] = {0x24, 0xD7, 0xEB, 0x38, 0xF8, 0x24};
 // #define BUS_FILTER 0.1
 #define UPDATE_RATE_USEC 10000
 #define UPDATE_RATE = (1000000 / UPDATE_RATE_USEC) // samples per second
-#define SIMULATE 1
+#define SIMULATE 0
 
 // Keep ranges aligned with ../Avia Display/src/global.h
 constexpr float kFuelQtyMin = 0.0f;
@@ -49,6 +50,24 @@ constexpr float kOilPressMax = 7.0f;
 constexpr float kChtMin = 0.0f;
 constexpr float kChtMax = 250.0f;
 
+// Post-conversion smoothing time constants (seconds).
+constexpr float kTauFuelQtySec = 10.0f;
+constexpr float kTauBatterySec = 3.0f;
+constexpr float kTauAmpSec = 3.0f;
+constexpr float kTauFuelPressSec = 2.0f;
+constexpr float kTauOilTempSec = 2.0f;
+constexpr float kTauOilPressSec = 2.0f;
+constexpr float kTauChtSec = 2.0f;
+constexpr float kTauRpmSec = 0.4f;
+
+constexpr int kTachPulsesPerRev = 1;
+constexpr float kTachMaxRpm = 2800.0f;
+constexpr uint32_t kTachMinPulseUs = static_cast<uint32_t>(60000000.0f / (kTachMaxRpm * kTachPulsesPerRev));
+constexpr uint32_t kTachSignalTimeoutUs = 500000;
+constexpr uint32_t kTachStormWindowUs = 1000000;
+constexpr uint32_t kTachStormMaxIsrPerWindow = 500;
+constexpr uint32_t kTachStormHoldoffUs = 2000000;
+
 // filtering
 #define MEDIAN_FILTER_SAMPLES 99
 #define MEDIAN_FILTER_AVG_SAMPLES 5 // the number of sample that we are going to get our value from.
@@ -61,8 +80,15 @@ RunningMedian filterCh3 = RunningMedian(MEDIAN_FILTER_SAMPLES);
 RunningMedian filterCh4 = RunningMedian(MEDIAN_FILTER_SAMPLES);
 RunningMedian filterCht1 = RunningMedian(15);
 
-int ampOffset = 0;
-bool ampReadingValid = false;
+constexpr int kAmpOffsetRaw = 1875;
+int ampOffset = kAmpOffsetRaw;
+bool ampReadingValid = true;
+
+volatile uint32_t tachLastPulseUs = 0;
+volatile uint32_t tachPeriodUs = 0;
+volatile uint32_t tachIsrWindowStartUs = 0;
+volatile uint32_t tachIsrWindowCount = 0;
+volatile uint32_t tachStormHoldoffUntilUs = 0;
 
 ESPNowTransmitter espNow(kRemotePeerMacAddress);
 MAX6675 t(THERM_SCK, THERM_CS, THERM_SO);
@@ -130,6 +156,54 @@ TFT_eSPI tft = TFT_eSPI(135, 240); // Invoke custom library
 
 void ICACHE_RAM_ATTR handleInterrupt()
 {
+}
+
+void IRAM_ATTR handleTachPulse()
+{
+  const uint32_t nowUs = static_cast<uint32_t>(esp_timer_get_time());
+
+  // If we've detected an interrupt storm, ignore tach edges for a short holdoff.
+  if (tachStormHoldoffUntilUs != 0 && static_cast<int32_t>(nowUs - tachStormHoldoffUntilUs) < 0)
+  {
+    return;
+  }
+
+  if (tachIsrWindowStartUs == 0 || (nowUs - tachIsrWindowStartUs) >= kTachStormWindowUs)
+  {
+    tachIsrWindowStartUs = nowUs;
+    tachIsrWindowCount = 0;
+  }
+
+  tachIsrWindowCount++;
+  if (tachIsrWindowCount > kTachStormMaxIsrPerWindow)
+  {
+    tachStormHoldoffUntilUs = nowUs + kTachStormHoldoffUs;
+    tachLastPulseUs = 0;
+    tachPeriodUs = 0;
+    tachIsrWindowStartUs = nowUs;
+    tachIsrWindowCount = 0;
+    return;
+  }
+
+  const uint32_t prevUs = tachLastPulseUs;
+
+  if (prevUs != 0)
+  {
+    const uint32_t periodUs = nowUs - prevUs;
+    if (periodUs < kTachMinPulseUs)
+    {
+      return;
+    }
+    // Reject impossible one-pulse jumps caused by edge chatter/ringing.
+    const uint32_t lastGoodPeriodUs = tachPeriodUs;
+    if (lastGoodPeriodUs > 0 && periodUs < (lastGoodPeriodUs / 2))
+    {
+      return;
+    }
+    tachPeriodUs = periodUs;
+  }
+
+  tachLastPulseUs = nowUs;
 }
 
 void setupWifi()
@@ -246,6 +320,8 @@ void setup()
   // Initialize the ADC
   analogReadResolution(ADC_RES);
   analogSetAttenuation(ADC_11db); // Set the input attenuation to 11 dB (for input voltages up to 3.6V)
+  pinMode(INTERRUPT_PIN, INPUT);
+  attachInterrupt(digitalPinToInterrupt(INTERRUPT_PIN), handleTachPulse, FALLING);
   espNow.init();
 
   // debug.printf("i: thermocouple: %f\n",thermocouple.readCelsius());
@@ -306,7 +382,9 @@ void updateScreen(int frame)
   SensorData data;
 
   static bool fuelQtyError, fuelPressError, oilPressError, oilTempError, ampError, cht1Error;
-  static float batteryVoltage, fuelPress, fuelLitres, oilTemp, oilPress, amp, cht1;
+  static float batteryVoltage, fuelPress, fuelLitres, oilTemp, oilPress, amp, cht1, rpm;
+  static bool smoothedInit = false;
+  static float smoothedBatteryVoltage, smoothedFuelPress, smoothedFuelLitres, smoothedOilTemp, smoothedOilPress, smoothedAmp, smoothedCht1, smoothedRpm;
 
   // amp is linear
   amp = ((0.0306 * (filterAmp.getMedianAverage(MEDIAN_FILTER_AVG_SAMPLES) - ampOffset) - 0.0454));
@@ -333,7 +411,12 @@ void updateScreen(int frame)
   oilPress = (-7.77482E-10 * pow(scaledOPress, 3)) + (9.95165E-07 * pow(scaledOPress, 2)) - (0.002652107 * scaledOPress) + 5.992594213;
 
   cht1 = filterCht1.getMedianAverage(MEDIAN_FILTER_AVG_SAMPLES);
-  if (cht1 < kChtMin || cht1 > kChtMax)
+  if (!isfinite(cht1))
+  {
+    cht1 = kChtMin;
+    cht1Error = true;
+  }
+  else if (cht1 < kChtMin || cht1 > kChtMax)
   {
     if (cht1 < kChtMin)
       cht1 = kChtMin;
@@ -343,6 +426,25 @@ void updateScreen(int frame)
   }
 
   fuelQtyError = fuelPressError = oilPressError = oilTempError = cht1Error = false;
+
+  {
+    uint32_t lastPulseUs;
+    uint32_t periodUs;
+    uint32_t stormHoldoffUntilUs;
+    noInterrupts();
+    lastPulseUs = tachLastPulseUs;
+    periodUs = tachPeriodUs;
+    stormHoldoffUntilUs = tachStormHoldoffUntilUs;
+    interrupts();
+
+    const uint32_t nowUs = static_cast<uint32_t>(esp_timer_get_time());
+    rpm = 0.0f;
+    const bool tachHoldoffActive = (stormHoldoffUntilUs != 0 && static_cast<int32_t>(nowUs - stormHoldoffUntilUs) < 0);
+    if (!tachHoldoffActive && periodUs > 0 && lastPulseUs > 0 && (nowUs - lastPulseUs) <= kTachSignalTimeoutUs)
+    {
+      rpm = 60000000.0f / (static_cast<float>(periodUs) * kTachPulsesPerRev);
+    }
+  }
 
   if (SIMULATE)
   {
@@ -362,6 +464,7 @@ void updateScreen(int frame)
     oilPress = wave(t * 0.4f + 4.0f, kOilPressMin, kOilPressMax, spanScale);
     cht1 = wave(t * 0.3f + 5.0f, kChtMin, kChtMax, spanScale);
     amp = wave(t * 0.6f + 6.0f, -20.0f, 20.0f, spanScale);
+    rpm = wave(t * 0.7f + 1.5f, 850.0f, 2800.0f, spanScale);
 
     ampReadingValid = true;
   }
@@ -410,6 +513,47 @@ void updateScreen(int frame)
     oilPressError = true;
   }
 
+  {
+    const float dtSec = (UPDATE_RATE_USEC * 10) / 1000000.0f; // screen updates every 10 timer ticks.
+    auto lowPass = [](float previous, float input, float tauSec, float dt) {
+      const float alpha = dt / (tauSec + dt);
+      return previous + alpha * (input - previous);
+    };
+
+    if (!smoothedInit)
+    {
+      smoothedBatteryVoltage = batteryVoltage;
+      smoothedFuelPress = fuelPress;
+      smoothedFuelLitres = fuelLitres;
+      smoothedOilTemp = oilTemp;
+      smoothedOilPress = oilPress;
+      smoothedAmp = amp;
+      smoothedCht1 = cht1;
+      smoothedRpm = rpm;
+      smoothedInit = true;
+    }
+    else
+    {
+      smoothedBatteryVoltage = lowPass(smoothedBatteryVoltage, batteryVoltage, kTauBatterySec, dtSec);
+      smoothedFuelPress = lowPass(smoothedFuelPress, fuelPress, kTauFuelPressSec, dtSec);
+      smoothedFuelLitres = lowPass(smoothedFuelLitres, fuelLitres, kTauFuelQtySec, dtSec);
+      smoothedOilTemp = lowPass(smoothedOilTemp, oilTemp, kTauOilTempSec, dtSec);
+      smoothedOilPress = lowPass(smoothedOilPress, oilPress, kTauOilPressSec, dtSec);
+      smoothedAmp = lowPass(smoothedAmp, amp, kTauAmpSec, dtSec);
+      smoothedCht1 = lowPass(smoothedCht1, cht1, kTauChtSec, dtSec);
+      smoothedRpm = lowPass(smoothedRpm, rpm, kTauRpmSec, dtSec);
+    }
+
+    batteryVoltage = smoothedBatteryVoltage;
+    fuelPress = smoothedFuelPress;
+    fuelLitres = smoothedFuelLitres;
+    oilTemp = smoothedOilTemp;
+    oilPress = smoothedOilPress;
+    amp = smoothedAmp;
+    cht1 = smoothedCht1;
+    rpm = smoothedRpm;
+  }
+
   ampError = !ampReadingValid;
 
   //-3E-07x2 + 0.006x - 1.0495
@@ -441,7 +585,7 @@ void updateScreen(int frame)
   }
   // TFT_printLine(string, true);
 
-  sprintf(string, "F Qty:%i %i   ", (int)fuelLitres, fuelQtyError);
+  sprintf(string, "F Qty:%3i %i T:%4i", (int)fuelLitres, fuelQtyError, (int)(rpm + 0.5f));
   yLocation += yIncrement;
   tft.setCursor(xLocation, yLocation);
   tft.print(string);
@@ -472,7 +616,7 @@ void updateScreen(int frame)
 
   if (ampReadingValid)
   {
-    sprintf(string, "Amp:%0.1f   ", amp);
+    sprintf(string, "Amp:%0.1f Z:%i   ", amp, ampOffset);
     yLocation += yIncrement;
     tft.setCursor(xLocation, yLocation);
     tft.print(string);
@@ -522,12 +666,6 @@ void loop()
       simMultiplier = getRandomFloat();
       nextSimulatedReading = millis() + 10000;
     }
-  }
-
-  if (!ampReadingValid && millis() > 10000)
-  {
-    ampOffset = filterAmp.getMedianAverage(MEDIAN_FILTER_AVG_SAMPLES);
-    ampReadingValid = true;
   }
 
   // this will run much faster than the actual screen update
