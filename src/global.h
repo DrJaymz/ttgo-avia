@@ -32,6 +32,20 @@
 #define DEBUG 1
 #define CHT1_COMPENSATION -15
 
+// Firmware version history (inferred from repo history + CHANGES.md):
+// 1.0.0 - Initial tagged/recorded repo version ("version 1.0" commit).
+// 1.0.1 - 2026-02-05 documentation tracking added (AGENTS.md, CHANGES.md).
+// 1.0.2 - 2026-02-23 README and wiring/docs update.
+// 1.1.0 - 2026-03-07 sensor smoothing and amp zero-cal display update.
+// 1.2.0 - 2026-03-13 tach input / RPM feature added.
+// 1.2.1 - 2026-03-16 tach reacquire and stale-period fix.
+// 2.0.0 - 2026-04-23 telemetry contract change (SensorData payload updated).
+// 2.0.1 - 2026-05-01 ESP-NOW transmit rate reduced from 10 Hz to 5 Hz.
+constexpr uint8_t FW_VERSION_MAJOR = 2;
+constexpr uint8_t FW_VERSION_MINOR = 0;
+constexpr uint8_t FW_VERSION_PATCH = 1;
+constexpr char FW_VERSION[] = "2.0.1";
+
 // ESP-NOW peer MAC (receiver). Update this to match the display unit.
 extern uint8_t kRemotePeerMacAddress[6];
 

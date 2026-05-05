@@ -3,8 +3,11 @@
 
 #include <Arduino.h>
 #include <esp_now.h>
+#include <esp_wifi.h>
 
 #include "global.h"
+
+constexpr uint8_t kEspNowChannel = 11;
 
 class ESPNowTransmitter
 {
@@ -19,13 +22,18 @@ public:
         memcpy(this->peerMacAddress, remoteAddress, 6);
         memset(&peerInfo, 0, sizeof(peerInfo));
         memcpy(peerInfo.peer_addr, remoteAddress, 6);
-        peerInfo.channel = 0;
+        peerInfo.channel = kEspNowChannel;
         peerInfo.encrypt = false;
     }
 
     bool init()
     {
         WiFi.mode(WIFI_STA);
+        if (esp_wifi_set_channel(kEspNowChannel, WIFI_SECOND_CHAN_NONE) != ESP_OK)
+        {
+            Serial.println("Failed to set WiFi channel");
+            return false;
+        }
         Serial.println("initializing ESP-NOW");
         if (esp_now_init() != ESP_OK)
         {
@@ -70,7 +78,9 @@ struct SensorData
     float oilPress;
     float amp;
     float cht1;
+    float rpm;
     bool ampError;
+    bool rpmError;
     int frame;
     unsigned long timestamp; //time in milliseconds
 };

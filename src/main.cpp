@@ -37,6 +37,8 @@ uint8_t kRemotePeerMacAddress[6] = {0x24, 0xD7, 0xEB, 0x38, 0xF8, 0x24};
 #define UPDATE_RATE_USEC 10000
 #define UPDATE_RATE = (1000000 / UPDATE_RATE_USEC) // samples per second
 #define SIMULATE 0
+#define SIMULATE_RPM 0
+constexpr int kTxEveryNFrames = 2;
 
 // Keep ranges aligned with ../Avia Display/src/global.h
 constexpr float kFuelQtyMin = 0.0f;
@@ -49,6 +51,24 @@ constexpr float kOilPressMin = 0.0f;
 constexpr float kOilPressMax = 7.0f;
 constexpr float kChtMin = 0.0f;
 constexpr float kChtMax = 250.0f;
+constexpr float kRpmMin = 0.0f;
+constexpr float kRpmMax = 3000.0f;
+constexpr float kSimBatteryMin = 12.2f;
+constexpr float kSimBatteryMax = 13.8f;
+constexpr float kSimFuelQtyMin = 48.0f;
+constexpr float kSimFuelQtyMax = 72.0f;
+constexpr float kSimFuelPressMin = 180.0f;
+constexpr float kSimFuelPressMax = 220.0f;
+constexpr float kSimOilTempMin = 75.0f;
+constexpr float kSimOilTempMax = 95.0f;
+constexpr float kSimOilPressMin = 3.5f;
+constexpr float kSimOilPressMax = 4.8f;
+constexpr float kSimChtMin = 130.0f;
+constexpr float kSimChtMax = 180.0f;
+constexpr float kSimAmpMin = -8.0f;
+constexpr float kSimAmpMax = 12.0f;
+constexpr float kSimRpmMin = 900.0f;
+constexpr float kSimRpmMax = 2400.0f;
 
 // Post-conversion smoothing time constants (seconds).
 constexpr float kTauFuelQtySec = 10.0f;
@@ -58,10 +78,10 @@ constexpr float kTauFuelPressSec = 2.0f;
 constexpr float kTauOilTempSec = 2.0f;
 constexpr float kTauOilPressSec = 2.0f;
 constexpr float kTauChtSec = 2.0f;
-constexpr float kTauRpmSec = 0.4f;
+constexpr float kTauRpmSec = 0.3f;
 
 constexpr int kTachPulsesPerRev = 1;
-constexpr float kTachMaxRpm = 2800.0f;
+constexpr float kTachMaxRpm = kRpmMax;
 constexpr uint32_t kTachMinPulseUs = static_cast<uint32_t>(60000000.0f / (kTachMaxRpm * kTachPulsesPerRev));
 constexpr uint32_t kTachSignalTimeoutUs = 500000;
 constexpr uint32_t kTachStormWindowUs = 1000000;
@@ -192,6 +212,14 @@ void IRAM_ATTR handleTachPulse()
     const uint32_t periodUs = nowUs - prevUs;
     if (periodUs < kTachMinPulseUs)
     {
+      return;
+    }
+    // After a long gap (engine stopped), re-sync on the first edge and
+    // wait for the next edge to form a valid period measurement.
+    if (periodUs > kTachSignalTimeoutUs)
+    {
+      tachPeriodUs = 0;
+      tachLastPulseUs = nowUs;
       return;
     }
     // Reject impossible one-pulse jumps caused by edge chatter/ringing.
@@ -381,7 +409,7 @@ void updateScreen(int frame)
 {
   SensorData data;
 
-  static bool fuelQtyError, fuelPressError, oilPressError, oilTempError, ampError, cht1Error;
+  static bool fuelQtyError, fuelPressError, oilPressError, oilTempError, ampError, cht1Error, rpmError;
   static float batteryVoltage, fuelPress, fuelLitres, oilTemp, oilPress, amp, cht1, rpm;
   static bool smoothedInit = false;
   static float smoothedBatteryVoltage, smoothedFuelPress, smoothedFuelLitres, smoothedOilTemp, smoothedOilPress, smoothedAmp, smoothedCht1, smoothedRpm;
@@ -456,16 +484,24 @@ void updateScreen(int frame)
       return mid + (s * 2.0f - 1.0f) * span;
     };
 
-    const float spanScale = 0.1f; // 10% of full range for smaller steps
-    batteryVoltage = wave(t * 0.5f, 11.0f, 14.5f, spanScale);
-    fuelLitres = wave(t * 0.2f + 1.0f, kFuelQtyMin, kFuelQtyMax, spanScale);
-    fuelPress = wave(t * 0.35f + 2.0f, kFuelPressMin, kFuelPressMax, spanScale);
-    oilTemp = wave(t * 0.25f + 3.0f, kOilTempMin, kOilTempMax, spanScale);
-    oilPress = wave(t * 0.4f + 4.0f, kOilPressMin, kOilPressMax, spanScale);
-    cht1 = wave(t * 0.3f + 5.0f, kChtMin, kChtMax, spanScale);
-    amp = wave(t * 0.6f + 6.0f, -20.0f, 20.0f, spanScale);
-    rpm = wave(t * 0.7f + 1.5f, 850.0f, 2800.0f, spanScale);
+    const float spanScale = 1.0f;
+    batteryVoltage = wave(t * 0.5f, kSimBatteryMin, kSimBatteryMax, spanScale);
+    fuelLitres = wave(t * 0.2f + 1.0f, kSimFuelQtyMin, kSimFuelQtyMax, spanScale);
+    fuelPress = wave(t * 0.35f + 2.0f, kSimFuelPressMin, kSimFuelPressMax, spanScale);
+    oilTemp = wave(t * 0.25f + 3.0f, kSimOilTempMin, kSimOilTempMax, spanScale);
+    oilPress = wave(t * 0.4f + 4.0f, kSimOilPressMin, kSimOilPressMax, spanScale);
+    cht1 = wave(t * 0.3f + 5.0f, kSimChtMin, kSimChtMax, spanScale);
+    amp = wave(t * 0.6f + 6.0f, kSimAmpMin, kSimAmpMax, spanScale);
+    if (SIMULATE_RPM)
+    {
+      rpm = wave(t * 0.7f + 1.5f, kSimRpmMin, kSimRpmMax, spanScale);
+    }
 
+    fuelQtyError = false;
+    fuelPressError = false;
+    oilPressError = false;
+    oilTempError = false;
+    cht1Error = false;
     ampReadingValid = true;
   }
 
@@ -554,6 +590,23 @@ void updateScreen(int frame)
     rpm = smoothedRpm;
   }
 
+  rpmError = false;
+  if (!isfinite(rpm))
+  {
+    rpm = kRpmMin;
+    rpmError = true;
+  }
+  else if (rpm < kRpmMin)
+  {
+    rpm = kRpmMin;
+    rpmError = true;
+  }
+  else if (rpm > kRpmMax)
+  {
+    rpm = kRpmMax;
+    rpmError = true;
+  }
+
   ampError = !ampReadingValid;
 
   //-3E-07x2 + 0.006x - 1.0495
@@ -622,6 +675,13 @@ void updateScreen(int frame)
     tft.print(string);
   }
 
+  // Keep the current ESP-NOW channel visible for quick bench verification.
+  tft.setTextDatum(BR_DATUM);
+  tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+  tft.drawString(String("CH") + String(kEspNowChannel), tft.width() - 2, tft.height() - 2);
+  tft.setTextDatum(TL_DATUM);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+
   data.fuelQtyError = fuelQtyError;
   data.fuelPressError = fuelPressError;
   data.oilPressError = oilPressError;
@@ -635,8 +695,14 @@ void updateScreen(int frame)
   data.amp = (int)amp + 0.5;
   data.ampError = ampError;
   data.cht1 = cht1;
+  data.rpm = rpm;
+  data.rpmError = rpmError;
+  data.timestamp = millis();
 
-  espNow.sendData(&data, sizeof(data));
+  if ((frame % kTxEveryNFrames) == 0)
+  {
+    espNow.sendData(&data, sizeof(data));
+  }
 }
 
 float getRandomFloat()

@@ -24,4 +24,6 @@
 ## Notes for Future Changes
 - Keep sensor calibration math and filter settings aligned with real hardware.
 - If simulation values change, update any display-side assumptions or demos.
+- Update firmware version constants in `src/global.h` on every functional modification.
+- Use normal semver-style bumps in `src/global.h`: increment patch/minor for routine firmware changes, and increment major when the ESP-NOW `SensorData` format or telemetry contract changes.
 - Document change sets in `CHANGES.md`.

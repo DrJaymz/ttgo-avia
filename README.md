@@ -2,6 +2,13 @@
 
 ESP32/TTGO sender firmware for Avia engine telemetry.
 
+## Recent Firmware Updates
+- Tach/RPM input is now implemented on `INTERRUPT_PIN` (`GPIO26`) using ISR pulse-period timing.
+- RPM is shown locally on the sender TFT and transmitted in ESP-NOW telemetry along with an `rpmError` status flag.
+- ESP-NOW telemetry now transmits at 5 Hz while the main sampling/filter loop continues to run at 100 Hz.
+- Per-channel post-conversion smoothing is in place for fuel quantity, battery, current, fuel pressure, oil temperature, oil pressure, CHT, and RPM.
+- The tach input was flight-tested on the aircraft and reported as working correctly.
+
 ## ESP32 Connection Summary
 
 ### Analog Sensor Inputs (ADC)
@@ -28,6 +35,11 @@ ESP32/TTGO sender firmware for Avia engine telemetry.
 | 35 | `BUTTON_1` | Button input, also deep-sleep wake (`esp_sleep_enable_ext0_wakeup`) |
 | 0 | `BUTTON_2` | Button input |
 
+### Tach / RPM Input
+| ESP32 GPIO | Define | Signal |
+|---|---|---|
+| 26 | `INTERRUPT_PIN` | Tach pulse input for RPM measurement |
+
 ### TFT Display (ST7789 via `TFT_eSPI` build flags)
 | ESP32 GPIO | Build Flag | Signal |
 |---|---|---|
@@ -41,7 +53,6 @@ ESP32/TTGO sender firmware for Avia engine telemetry.
 
 ## Defined But Not Currently Used In Logic
 - `ADC_EN` on GPIO 14 is defined in `src/global.h` but not toggled in `src/main.cpp`.
-- `INTERRUPT_PIN` on GPIO 26 is defined but not used.
 - `DAC_CH1` on GPIO 25 is defined in `src/main.cpp` but not used.
 
 ## ADC2 Limitation (Important)
